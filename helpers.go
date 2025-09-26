@@ -47,16 +47,90 @@ func (d *doerWithToken) Do(req *http.Request) (*http.Response, error) {
 	return client.Do(req)
 }
 
-// FolderResponse represents a response from the CreateFolderWithBody method.
-type FolderResponse struct {
+type indexEntryResponseT struct {
+	Data []struct {
+		ID   int64  `json:"id"`
+		Name string `json:"name"`
+	} `json:"data"`
+}
+
+// Ptr returns a pointer to the provided value.
+func Ptr[T any](v T) *T {
+	return &v
+}
+
+// getFolder queries FolderFort to see if the named folder exists within the provided parentID.
+func (c *Client) getFolder(ctx context.Context, name string, parentID *int64) (*int64, error) {
+	// log.Printf("GML: getFolder(name=%q, parentID=%#v)", name, parentID)
+
+	params := &IndexEntryParams{
+		Query: &name,
+		Type:  Ptr(IndexEntryParamsTypeFolder),
+	}
+	if parentID != nil {
+		parentIDs := []string{fmt.Sprintf("%v", *parentID)}
+		params.ParentIds = &parentIDs
+	}
+
+	resp, err := c.IndexEntry(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("c.IndexEntry: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("io.ReadAll: %w", err)
+	}
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("failed to get folder '%v': %s", name, body)
+	}
+
+	var indexEntryResp indexEntryResponseT
+	if err := json.Unmarshal(body, &indexEntryResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response for folder '%v': %w\n%s", name, err, body)
+	}
+
+	for _, v := range indexEntryResp.Data {
+		if v.Name == name {
+			return &v.ID, nil
+		}
+	}
+
+	return nil, fmt.Errorf("unable to find folder %q", name)
+}
+
+type createFolderWithBodyResponse struct {
 	Folder struct {
 		ID int64 `json:"id"`
 	} `json:"folder"`
 }
 
-// CreateNewFolder creates a new folder on FolderFort with an optional parentID.
-// On success, it returns the created folder ID.
-func (c *Client) CreateNewFolder(ctx context.Context, name string, parentID *int64) (*int64, error) {
+// GetOrCreateFolder gets or creates a folder on FolderFort starting with an optional parentID.
+// On success, it returns the created folder ID. It recursively creates all intermediate folders if needed.
+func (c *Client) GetOrCreateFolder(ctx context.Context, name string, parentID *int64) (*int64, error) {
+	// log.Printf("GML: GetOrCreateFolder(name=%q, parentID=%#v)", name, parentID)
+
+	if name == "" {
+		return nil, errors.New("name must not be empty")
+	}
+
+	parentDir, baseDir := filepath.Split(name)
+	parentDir = strings.TrimSuffix(parentDir, "/")
+	if parentDir != "" {
+		var err error
+		parentID, err = c.GetOrCreateFolder(ctx, parentDir, parentID)
+		name = baseDir
+		if err != nil {
+			return nil, fmt.Errorf("unable to create folder %q: %w", parentDir, err)
+		}
+	}
+
+	// Check to see if this folder already exists. If not, create it.
+	if id, err := c.getFolder(ctx, name, parentID); err == nil {
+		return id, nil
+	}
+
 	payload := map[string]interface{}{
 		"name": name,
 	}
@@ -83,7 +157,7 @@ func (c *Client) CreateNewFolder(ctx context.Context, name string, parentID *int
 		return nil, fmt.Errorf("failed to create folder '%v': %s", name, body)
 	}
 
-	var folderResp FolderResponse
+	var folderResp createFolderWithBodyResponse
 	if err := json.Unmarshal(body, &folderResp); err != nil {
 		return nil, fmt.Errorf("failed to parse response for folder '%v': %w\n%s", name, err, body)
 	}
@@ -112,7 +186,25 @@ func (c *Client) UploadFileFromPath(ctx context.Context, filePath string, parent
 }
 
 // UploadFile uploads a file to FolderFort using the provided contentType and folder parentID (or nil for root folder).
+// If fileName contains parent folder(s), it recursively creates all intermediate folders if needed.
 func (c *Client) UploadFile(ctx context.Context, fileName string, r io.Reader, mimeType string, parentID *int64) error {
+	// log.Printf("GML: UploadFile(fileName=%q, mimeType=%q, parentID=%#v)", fileName, mimeType, parentID)
+
+	if fileName == "" {
+		return errors.New("fileName must not be empty")
+	}
+
+	parentDir, baseName := filepath.Split(fileName)
+	parentDir = strings.TrimSuffix(parentDir, "/")
+	if parentDir != "" {
+		var err error
+		parentID, err = c.GetOrCreateFolder(ctx, parentDir, parentID)
+		fileName = baseName
+		if err != nil {
+			return fmt.Errorf("unable to create folder %q: %w", parentDir, err)
+		}
+	}
+
 	// Create a buffer to store our request body
 	var requestBody bytes.Buffer
 	writer := io.Writer(&requestBody)
@@ -194,13 +286,13 @@ func (c *Client) UploadDirectory(ctx context.Context, directoryPath string, pare
 		}
 
 		if entry.IsDir() {
-			// Create folder
+			// Get or create folder
 			folderName := entry.Name()
-			folderID, err := c.CreateNewFolder(ctx, folderName, parentID)
+			folderID, err := c.GetOrCreateFolder(ctx, folderName, parentID)
 			if err != nil {
 				return err
 			}
-			log.Printf("Created folder: %v (ID: %v)\n", folderName, *folderID)
+			// log.Printf("GML: folder: %v (ID: %v)\n", folderName, *folderID)
 			// Recursively upload contents of this folder
 			if err := c.UploadDirectory(ctx, itemPath, folderID, excludePatterns); err != nil {
 				return err
