@@ -14,11 +14,13 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/gmlewis/go-httpdebug/httpdebug"
 )
 
 // NewClientWithAPIToken creates a new client that automatically adds
 // `Authorization: Bearer <API_TOKEN>` to all requests.
-func NewClientWithAPIToken(server, apiToken string) (*Client, error) {
+func NewClientWithAPIToken(server, apiToken string, debug bool) (*Client, error) {
 	if server == "" || apiToken == "" {
 		return nil, errors.New("missing server or apiToken")
 	}
@@ -28,7 +30,7 @@ func NewClientWithAPIToken(server, apiToken string) (*Client, error) {
 	}
 
 	authOpt := func(c *Client) error {
-		c.Client = &doerWithToken{apiToken: apiToken}
+		c.Client = &doerWithToken{apiToken: apiToken, debug: debug}
 		return nil
 	}
 
@@ -37,6 +39,7 @@ func NewClientWithAPIToken(server, apiToken string) (*Client, error) {
 
 type doerWithToken struct {
 	apiToken string
+	debug    bool
 }
 
 var _ HttpRequestDoer = &doerWithToken{}
@@ -44,19 +47,57 @@ var _ HttpRequestDoer = &doerWithToken{}
 func (d *doerWithToken) Do(req *http.Request) (*http.Response, error) {
 	req.Header.Set("Authorization", "Bearer "+d.apiToken)
 	client := &http.Client{}
+	if d.debug {
+		ct := httpdebug.New()
+		client = &http.Client{Transport: ct}
+	}
 	return client.Do(req)
 }
 
 type indexEntryResponseT struct {
 	Data []struct {
-		ID   int64  `json:"id"`
-		Name string `json:"name"`
+		ID       int64  `json:"id"`
+		Name     string `json:"name"`
+		FileName string `json:"file_name"`
+		ParentID int64  `json:"parent_id"`
+		Path     string `json:"path"`
 	} `json:"data"`
 }
 
 // Ptr returns a pointer to the provided value.
 func Ptr[T any](v T) *T {
 	return &v
+}
+
+// DeleteEntries deletes entries by ID.
+func (c *Client) DeleteEntries(ctx context.Context, ids []string) error {
+	// curl -X POST ' https://na.folderfort.com/api/v1/file-entries' \
+	// -H 'Authorization: Bearer YOUR_ACCESS_TOKEN' \
+	// -H 'accept: application/json' \
+	// -H 'Content-Type: application/json' \
+	// -H 'X-HTTP-Method-Override: DELETE' \
+	// --data '{"entryIds":[12345],"deleteForever":false}'
+	log.Printf("GML: DeleteEntries(ids=%+v)", ids)
+
+	req := EntriesDeleteJSONRequestBody{
+		EntryIds: &ids,
+	}
+
+	resp, err := c.EntriesDelete(ctx, req)
+	if err != nil {
+		return fmt.Errorf("c.EntriesDelete: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("io.ReadAll: %w", err)
+	}
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("failed to delete entries %+v: %s", ids, body)
+	}
+
+	return nil
 }
 
 // getEntriesByName queries FolderFort to see if one or more named entries exist within the provided parentID.
@@ -94,7 +135,12 @@ func (c *Client) getEntriesByName(ctx context.Context, name string, parentID *in
 
 	var results []int64
 	for _, v := range indexEntryResp.Data {
+		if parentID != nil && *parentID != v.ParentID {
+			log.Printf("GML: getEntriesByName: QUERY IGNORED ParentIDs!: Name=%q, ID=%v, ParentID=%v, FileName=%q, Path=%q", v.Name, v.ID, v.ParentID, v.FileName, v.Path)
+			continue
+		}
 		if v.Name == name {
+			log.Printf("GML: getEntriesByName: FOUND MATCH: Name=%q, ID=%v, ParentID=%v, FileName=%q, Path=%q", v.Name, v.ID, v.ParentID, v.FileName, v.Path)
 			results = append(results, v.ID)
 		}
 	}
@@ -187,7 +233,8 @@ func (c *Client) GetOrCreateFolder(ctx context.Context, name string, parentID *i
 
 // UploadFileFromPath uploads a file to FolderFort using the provided contentType and folder parentID (or nil for root folder).
 // It guesses the mimeType based on the extension of the filePath or defaults to "application/octet-stream".
-func (c *Client) UploadFileFromPath(ctx context.Context, filePath string, parentID *int64) error {
+// If overwrite is true, then any existing files of the same name in the same folder will first be deleted.
+func (c *Client) UploadFileFromPath(ctx context.Context, filePath string, parentID *int64, overwrite bool) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("error opening file %v: %w", filePath, err)
@@ -201,12 +248,13 @@ func (c *Client) UploadFileFromPath(ctx context.Context, filePath string, parent
 		mimeType = "application/octet-stream"
 	}
 
-	return c.UploadFile(ctx, fileName, file, mimeType, parentID)
+	return c.UploadFile(ctx, fileName, file, mimeType, parentID, overwrite)
 }
 
 // UploadFile uploads a file to FolderFort using the provided contentType and folder parentID (or nil for root folder).
 // If fileName contains parent folder(s), it recursively creates all intermediate folders if needed.
-func (c *Client) UploadFile(ctx context.Context, fileName string, r io.Reader, mimeType string, parentID *int64) error {
+// If overwrite is true, then any existing files of the same name in the same folder will first be deleted.
+func (c *Client) UploadFile(ctx context.Context, fileName string, r io.Reader, mimeType string, parentID *int64, overwrite bool) error {
 	// log.Printf("GML: UploadFile(fileName=%q, mimeType=%q, parentID=%#v)", fileName, mimeType, parentID)
 
 	if fileName == "" {
@@ -221,6 +269,21 @@ func (c *Client) UploadFile(ctx context.Context, fileName string, r io.Reader, m
 		fileName = baseName
 		if err != nil {
 			return fmt.Errorf("unable to create folder %q: %w", parentDir, err)
+		}
+	}
+
+	if overwrite {
+		ids, err := c.getEntriesByName(ctx, fileName, parentID, nil)
+		if err != nil {
+			log.Printf("getEntriesByName: %v (ignoring)", err)
+		} else if len(ids) > 0 {
+			strIDs := make([]string, 0, len(ids))
+			for _, id := range ids {
+				strIDs = append(strIDs, fmt.Sprintf("%v", id))
+			}
+			if err := c.DeleteEntries(ctx, strIDs); err != nil {
+				log.Printf("c.DeleteEntries(ids=%+v): %v (ignoring)", ids, err)
+			}
 		}
 	}
 
@@ -273,6 +336,8 @@ func shouldExclude(path string, excludePatterns []string) bool {
 	return false
 }
 
+// UploadDirectory uploads the contents of a directory to FolderFort.
+// If any filename already exists, it is overwritten.
 func (c *Client) UploadDirectory(ctx context.Context, directoryPath string, parentID *int64, excludePatterns []string) error {
 	if excludePatterns == nil {
 		excludePatterns = []string{".git", "__pycache__", ".DS_Store", ".env", "venv", "node_modules"}
@@ -318,7 +383,7 @@ func (c *Client) UploadDirectory(ctx context.Context, directoryPath string, pare
 			}
 		} else {
 			// Upload file
-			if err := c.UploadFileFromPath(ctx, itemPath, parentID); err != nil {
+			if err := c.UploadFileFromPath(ctx, itemPath, parentID, true); err != nil {
 				return err
 			}
 			// Add a small delay to avoid overwhelming the API

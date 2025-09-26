@@ -1225,12 +1225,14 @@ func NewEntriesDeleteRequestWithBody(server string, contentType string, body io.
 		return nil, err
 	}
 
-	req, err := http.NewRequest("DELETE", queryURL.String(), body)
+	req, err := http.NewRequest("POST", queryURL.String(), body)
 	if err != nil {
 		return nil, err
 	}
 
+	req.Header.Add("Accept", "application/json")
 	req.Header.Add("Content-Type", contentType)
+	req.Header.Add("X-HTTP-Method-Override", "DELETE")
 
 	return req, nil
 }

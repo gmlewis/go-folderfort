@@ -26,6 +26,7 @@ const (
 
 var (
 	baseURL    = flag.String("url", "https://na.folderfort.com/api/v1", "FolderFort base API URL")
+	debug      = flag.Bool("debug", true, "Debug API calls")
 	folderName = flag.String("folder", "", "Name of folder to get or create on FolderFort")
 )
 
@@ -48,7 +49,7 @@ func main() {
 	if apiToken == "" {
 		log.Fatalf("Missing %q env var", tokenEnvVar)
 	}
-	fc, err := folderfort.NewClientWithAPIToken(*baseURL, apiToken)
+	fc, err := folderfort.NewClientWithAPIToken(*baseURL, apiToken, *debug)
 	must(err)
 	ctx := context.Background()
 
