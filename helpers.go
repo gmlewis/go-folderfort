@@ -59,13 +59,14 @@ func Ptr[T any](v T) *T {
 	return &v
 }
 
-// getFolder queries FolderFort to see if the named folder exists within the provided parentID.
-func (c *Client) getFolder(ctx context.Context, name string, parentID *int64) (*int64, error) {
-	// log.Printf("GML: getFolder(name=%q, parentID=%#v)", name, parentID)
+// getEntriesByName queries FolderFort to see if one or more named entries exist within the provided parentID.
+// An optional type can be provided to narrow the search.
+func (c *Client) getEntriesByName(ctx context.Context, name string, parentID *int64, typ *IndexEntryParamsType) ([]int64, error) {
+	// log.Printf("GML: getEntriesByName(name=%q, parentID=%#v)", name, parentID)
 
 	params := &IndexEntryParams{
 		Query: &name,
-		Type:  Ptr(IndexEntryParamsTypeFolder),
+		Type:  typ, // OK if nil
 	}
 	if parentID != nil {
 		parentIDs := []string{fmt.Sprintf("%v", *parentID)}
@@ -91,10 +92,28 @@ func (c *Client) getFolder(ctx context.Context, name string, parentID *int64) (*
 		return nil, fmt.Errorf("failed to parse response for folder '%v': %w\n%s", name, err, body)
 	}
 
+	var results []int64
 	for _, v := range indexEntryResp.Data {
 		if v.Name == name {
-			return &v.ID, nil
+			results = append(results, v.ID)
 		}
+	}
+
+	return results, nil
+}
+
+// getFolder queries FolderFort to see if the named folder exists within the provided parentID.
+// It does not support parent folders (e.g. "parent/folder-name").
+func (c *Client) getFolder(ctx context.Context, name string, parentID *int64) (*int64, error) {
+	// log.Printf("GML: getFolder(name=%q, parentID=%#v)", name, parentID)
+
+	ids, err := c.getEntriesByName(ctx, name, parentID, Ptr(IndexEntryParamsTypeFolder))
+	if err != nil {
+		return nil, err
+	}
+
+	if len(ids) > 0 {
+		return &ids[0], nil
 	}
 
 	return nil, fmt.Errorf("unable to find folder %q", name)
